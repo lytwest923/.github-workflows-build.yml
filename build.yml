@@ -1,0 +1,288 @@
+name: Build Tile Bot APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Create project files
+        run: |
+          mkdir -p proj/app/src/main/java/com/example/tilebot proj/app/src/main/res/xml
+          cd proj
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              plugins {
+                  id 'com.android.application' version '8.5.2'
+                  id 'org.jetbrains.kotlin.android' version '1.9.24'
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'TileBot'
+          include ':app'
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.example.tilebot'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.tilebot'
+                  minSdk 30
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="Tile Bot"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="Tile Bot"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:notificationTimeout="100" />
+          EOF
+
+          cat > app/src/main/java/com/example/tilebot/MainActivity.kt <<'EOF'
+          package com.example.tilebot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                  }
+
+                  val status = TextView(this).apply {
+                      textSize = 16f
+                      text = "1) Erişilebilirlik ayarlarından servisi aç\n2) Başlat'a bas\n3) Magic Tiles 3'ü aç, şarkıyı başlat"
+                  }
+
+                  val settingsBtn = Button(this).apply {
+                      text = "Erişilebilirlik ayarlarını aç"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+
+                  val toggleBtn = Button(this).apply {
+                      text = "Başlat"
+                      setOnClickListener {
+                          if (TapService.instance == null) {
+                              status.text = "Servis kapalı. Önce erişilebilirlik ayarlarından aç."
+                          } else {
+                              TapService.active = !TapService.active
+                              text = if (TapService.active) "Durdur" else "Başlat"
+                              status.text = if (TapService.active) "Çalışıyor. Oyuna geç." else "Durdu."
+                          }
+                      }
+                  }
+
+                  layout.addView(status)
+                  layout.addView(settingsBtn)
+                  layout.addView(toggleBtn)
+                  setContentView(layout)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/tilebot/TapService.kt <<'EOF'
+          package com.example.tilebot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Display
+          import android.view.accessibility.AccessibilityEvent
+
+          class TapService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var active = false
+                  var instance: TapService? = null
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val lastTap = LongArray(4)
+              private var busy = false
+
+              // Ayarlar: ihtiyaca göre değiştir
+              private val columns = 4
+              private val scanTop = 0.50f
+              private val scanBottom = 0.85f
+              private val darkLimit = 55
+              private val minDarkSamples = 3
+              private val cooldownMs = 220L
+
+              override fun onServiceConnected() {
+                  instance = this
+                  loop()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  instance = null
+                  active = false
+                  super.onDestroy()
+              }
+
+              private fun loop() {
+                  if (active && !busy) capture()
+                  handler.postDelayed({ loop() }, 40)
+              }
+
+              private fun capture() {
+                  busy = true
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                      override fun onSuccess(result: ScreenshotResult) {
+                          try {
+                              val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                              val bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                              result.hardwareBuffer.close()
+                              if (bmp != null) scan(bmp)
+                          } finally {
+                              busy = false
+                          }
+                      }
+
+                      override fun onFailure(errorCode: Int) {
+                          busy = false
+                      }
+                  })
+              }
+
+              private fun scan(bmp: Bitmap) {
+                  val w = bmp.width
+                  val h = bmp.height
+                  val now = System.currentTimeMillis()
+                  val rows = 40
+                  for (c in 0 until columns) {
+                      if (now - lastTap[c] < cooldownMs) continue
+                      val cx = (w * (c + 0.5f) / columns).toInt()
+                      var count = 0
+                      var lowestY = -1
+                      for (r in 0 until rows) {
+                          val y = (h * (scanTop + (scanBottom - scanTop) * r / rows)).toInt()
+                          if (isDark(bmp.getPixel(cx, y))) {
+                              count++
+                              lowestY = y
+                          }
+                      }
+                      if (count >= minDarkSamples && lowestY > 0) {
+                          lastTap[c] = now
+                          tap(cx.toFloat(), lowestY.toFloat())
+                      }
+                  }
+                  bmp.recycle()
+              }
+
+              private fun isDark(p: Int): Boolean =
+                  Color.red(p) < darkLimit && Color.green(p) < darkLimit && Color.blue(p) < darkLimit
+
+              private fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 25)
+                  dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+              }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Tile Bot v${{ github.run_number }}
+          files: proj/app/build/outputs/apk/debug/app-debug.apk
